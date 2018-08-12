@@ -6,6 +6,11 @@ ini_set('session.gc_maxlifetime', MONTH);
 // each client should remember their session id for EXACTLY 1 month
 session_set_cookie_params(MONTH);
 session_start();
+$db2 = new PDO(sprintf('mysql:host=%s;dbname=%s;charset=utf8mb4', DB_HOST, DB_NAME), DB_USER, DB_PASS, [
+  PDO::ATTR_EMULATE_PREPARES   => false, // turn off emulation mode for "real" prepared statements
+  PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION, //turn on errors in the form of exceptions
+  PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC, //make the default fetch be an associative array
+]);
 $db = new mysqli(DB_HOST, DB_USER, DB_PASS, DB_NAME);
 $db->set_charset("utf8");
 
@@ -13,288 +18,355 @@ header("Content-type: application/json");
 
 // Authenticate the user through the Google API and return their data
 function auth($db, $token = "") {
-  $auth = isset($_SESSION['auth']) ? $_SESSION['auth']:"";
-  $query = "SELECT * FROM users WHERE email = '".$db->real_escape_string($auth)."' LIMIT 1";
-  $result = $db->query($query) or die($db->error());
-  $user = $result->fetch_assoc();
-  $result->free();
-  if($user) {
-    if(!isset($user['languages']) || empty($user['languages'])) $user['languages'] = array();
-    else $user['languages'] = array_map('intval',explode(',',$user['languages']));
+  global $db2;
+
+  if(array_key_exists('auth', $_SESSION)) {
+    $email = $_SESSION['auth'];
+    $query = $db2->prepare('SELECT * FROM users WHERE email = ? LIMIT 1');
+    $query->execute([$email]);
+
+    $user = $query->fetch();
+    if(!$user) {
+      header('HTTP/1.0 401 Unauthorized');
+      return ['error' => 'No account found'];
+    }
+
+    $user['languages'] = $user['languages'] ? array_map('intval', explode(',', $user['languages'])) : [];
+
     return $user;
-  } elseif($auth) {
-    header('HTTP/1.0 401 Unauthorized');
-    return array("error"=>"No account found");
-  } elseif($token) {
+  }
+
+  if($token) {
     $postData = "code=".urlencode($token).
                 "&client_id=".urlencode(GAPPS_CLIENTID).
                 "&client_secret=".urlencode(GAPPS_CLIENTSECRET).
                 "&redirect_uri=".urlencode(GAPPS_REDIRECT).
                 "&grant_type=authorization_code";
     $ch = curl_init();
-    curl_setopt($ch,CURLOPT_URL, "https://www.googleapis.com/oauth2/v3/token");
-    curl_setopt($ch,CURLOPT_POST, true);
-    curl_setopt($ch,CURLOPT_POSTFIELDS, $postData);
-    curl_setopt($ch,CURLOPT_RETURNTRANSFER,true);
+    curl_setopt($ch, CURLOPT_URL, "https://www.googleapis.com/oauth2/v3/token");
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $postData);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER,true);
     $result = json_decode(curl_exec($ch));
     curl_close($ch);
-    if(isset($result->error)) {
-      return array("error"=>"invalid_token");
-    } else {
-      $token = $result->access_token;
-      $userinfo = json_decode(file_get_contents("https://www.googleapis.com/oauth2/v2/userinfo?access_token=".$token));
-      if($userinfo->verified_email) {
-        $_SESSION['auth'] = $userinfo->email;
-        return auth($db);
-      } else {
-        return array("error"=>"invalid_email");
-      }
+
+    if($result->error) {
+      return ['error' => 'invalid_token'];
     }
-  } else {
-    $url = 'https://accounts.google.com/o/oauth2/auth?'.
-           'scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fuserinfo.email'.
-           '&response_type=code'.
-           '&redirect_uri='.urlencode(GAPPS_REDIRECT).
-           '&client_id='.urlencode(GAPPS_CLIENTID);
-    return array("login"=>$url);
+
+    $token = $result->access_token;
+    $userinfo = json_decode(file_get_contents("https://www.googleapis.com/oauth2/v2/userinfo?access_token=".$token));
+
+    if($userinfo->verified_email) {
+      $_SESSION['auth'] = $userinfo->email;
+      return auth($db);
+    }
+
+    return ['error' => 'invalid_email'];
   }
+
+  $url = 'https://accounts.google.com/o/oauth2/auth?'.
+    'scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fuserinfo.email' .
+    '&response_type=code' .
+    '&redirect_uri='  . urlencode(GAPPS_REDIRECT) .
+    '&client_id=' . urlencode(GAPPS_CLIENTID);
+
+  return ['login' => $url];
 }
 
 // get a list of all questions with sets and languages
 function getQuestions($db) {
-  $query = "SELECT q.*, GROUP_CONCAT(DISTINCT set_id) sets, GROUP_CONCAT(DISTINCT qto.language_id) languages FROM questions q
-        LEFT JOIN question_cards qc ON qc.question_id = q.id
-        LEFT JOIN card_sets cs ON cs.card_id = qc.card_id
-        LEFT JOIN sets s ON s.id = cs.set_id
-        LEFT JOIN question_translations qt ON qt.question_id = q.id AND qt.language_id = 1
-		LEFT JOIN question_translations qto ON qto.question_id = q.id AND qto.changedate >= qt.changedate
-        WHERE s.regular = 1 AND q.live = 1
-        GROUP BY q.id, qc.card_id";
-  $result = $db->query($query) or die($db->error());
-  $questions = array();
-  while($row = $result->fetch_assoc()) {
-    $row["difficulty"] = intval($row["difficulty"]);
-    $row["id"] = intval($row["id"]);
-    $row["sets"] = array_map('intval',explode(",",$row["sets"]));
-    $row["languages"] = array_map('intval',explode(",",$row["languages"]));
-    if(!$row["author"]) unset($row["author"]);
-    if(!isset($questions[$row["id"]])) {
-      $questions[$row["id"]] = $row;
-      $questions[$row["id"]]['cards'] = array();
-      unset($questions[$row["id"]]["sets"]);
-      unset($questions[$row["id"]]["live"]);
+  global $db2;
+  // TODO: remove `GROUP BY qc.card_id`
+  $query = $db2->query('
+    SELECT q.id, q.difficulty, GROUP_CONCAT(DISTINCT set_id) sets, GROUP_CONCAT(DISTINCT qto.language_id) languages
+    FROM questions q
+    LEFT JOIN question_cards qc ON qc.question_id = q.id
+    LEFT JOIN card_sets cs ON cs.card_id = qc.card_id
+    LEFT JOIN sets s ON s.id = cs.set_id
+    LEFT JOIN question_translations qt ON qt.question_id = q.id AND qt.language_id = 1
+    LEFT JOIN question_translations qto ON qto.question_id = q.id AND qto.changedate >= qt.changedate
+    WHERE s.regular = 1 AND q.live = 1
+    GROUP BY q.id, qc.card_id
+  ');
+
+  $questions = [];
+  while($row = $query->fetch()) {
+    if(!array_key_exists($row['id'], $questions)) {
+      $questions[$row['id']] = [
+        'id' => $row['id'],
+        'difficulty' => $row['difficulty'],
+        // TODO: change `cards` property to `sets`, checking on frontend too
+        'cards' => [],
+        'languages' => array_map('intval', explode(',', $row['languages'])),
+      ];
     }
-    array_push($questions[$row["id"]]['cards'], $row["sets"]);
+
+    $questions[$row['id']]['cards'][] = array_map('intval', explode(',', $row['sets']));
   }
-  $result->free();
+
   return array_values($questions);
 }
 
 // get a single question with cards and texts
 function getQuestion($db, $id = false, $lang = false) {
-  $output = array();
-  if($id && $lang && intval($id) && intval($lang)) {
-    // get question metadata
-    $query = "SELECT q.*, qt.question, qt.answer, IF(qto.changedate > qt.changedate, true, false) as outdated
-          FROM questions q
-          LEFT JOIN question_translations qt ON qt.question_id = q.id AND qt.language_id = ".$db->real_escape_string($lang)."
-          LEFT JOIN question_translations qto ON qto.question_id = q.id AND qto.language_id = 1
-          WHERE q.id = ".$db->real_escape_string($id)."
-          LIMIT 1";
-    $result = $db->query($query) or die($db->error);
-    $output = array("metadata"=>$result->fetch_assoc());
-    if(isset($output['metadata'])) {
-      $output['cards'] = array();
-      $output["question"] = strip_tags($output["metadata"]["question"]);
-      unset($output["metadata"]["question"]);
-      $output["answer"] = strip_tags($output["metadata"]["answer"]);
-      unset($output["metadata"]["answer"]);
-      $output["metadata"]["live"] = !!($output["metadata"]["live"]);
-      $output["metadata"]["outdated"] = !!($output["metadata"]["outdated"]);
-      $output["metadata"]["id"] = intval($output["metadata"]["id"]);
-      $output["metadata"]["difficulty"] = intval($output["metadata"]["difficulty"]);
-    }
-    $result->free();
-    $query = "SELECT c.*, IFNULL(ct.name, c.name) name, c.name name_en, IFNULL(ct.multiverseid, c.multiverseid) multiverseid
-          FROM question_cards qc
-          LEFT JOIN cards c ON c.id = qc.card_id
-          LEFT JOIN card_translations ct ON ct.card_id = qc.card_id AND ct.language_id = ".$db->real_escape_string($lang)."
-          WHERE qc.question_id = ".$db->real_escape_string($id)."
-          ORDER BY qc.sort ASC, c.layout, name ASC";
-    $result = $db->query($query) or die($db->error);
-    while($row = $result->fetch_assoc()) {
-      $row["text"] = nl2br($row["text"]);
-      $row["multiverseid"] = intval($row["multiverseid"]);
-      foreach($row as $field=>$value) {
-        if($value === "" || $value === null || $field == "id") unset($row[$field]);
-      }
-      array_push($output["cards"], $row);
-    }
-    $result->free();
+  global $db2;
+
+  // if $id or $lang are not provided
+  // return empty array
+  // TODO: probably we should return 404
+  if(!$id || !$lang) {
+    return [];
   }
+
+  $questionStmt = $db2->prepare(
+    'SELECT q.*, qt.question, qt.answer, IF(qto.changedate > qt.changedate, true, false) as outdated
+    FROM questions q
+    LEFT JOIN question_translations qt ON qt.question_id = q.id AND qt.language_id = :lang
+    LEFT JOIN question_translations qto ON qto.question_id = q.id AND qto.language_id = 1
+    WHERE q.id = :question
+    LIMIT 1'
+  );
+
+  $questionStmt->execute([
+    'lang' => $lang,
+    'question' => $id,
+  ]);
+
+  $question = $questionStmt->fetch();
+
+  // if question/lang doesn't exist
+  // return empty array
+  // TODO: probably we should return 404
+  if(!$question) {
+    return [];
+  }
+
+  $output = [
+    // TODO: strip_tags on creation, non every get
+    'question' => strip_tags($question['question']),
+    'answer' => strip_tags($question['answer']),
+    'metadata' => [
+      'live' => !!$question['live'],
+      'outdated' => !!$question['outdated'],
+      'id' => $question['id'],
+      'difficulty' => $question['difficulty'],
+    ],
+    'cards' => [],
+  ];
+
+  $cardsStmt = $db2->prepare(
+    'SELECT c.*, IFNULL(ct.name, c.name) name, c.name name_en, IFNULL(ct.multiverseid, c.multiverseid) multiverseid
+    FROM cards c
+    JOIN question_cards qc ON qc.card_id = c.id
+    LEFT JOIN card_translations ct ON ct.card_id = c.id AND ct.language_id = :lang
+    WHERE qc.question_id = :question
+    ORDER BY qc.sort ASC, c.layout, name'
+  );
+
+  $cardsStmt->execute([
+    'lang' => $lang,
+    'question' => $id,
+  ]);
+
+  while($card = $cardsStmt->fetch()) {
+    $card['text'] = nl2br($card['text']);
+
+    // Do we really need to remove empty fields?
+    $card = array_filter($card, function ($value, $field) {
+      return !($value === "" || $value === null || $field == 'id');
+    }, ARRAY_FILTER_USE_BOTH);
+
+    $output['cards'][] = $card;
+  }
+
   return $output;
 }
 
 // get a list of sets
 function getSets($db) {
-  $query = "SELECT id, name, code, releasedate, standard, modern FROM sets
-        WHERE regular = 1
-        ORDER BY releasedate DESC";
-  $result = $db->query($query) or die($db->error());
-  $output = array();
-  while($row = $result->fetch_assoc()) {
-    $row["id"] = intval($row["id"]);
-    $row["standard"] = intval($row["standard"]);
-    $row["modern"] = intval($row["modern"]);
-    array_push($output, $row);
-  }
-  $result->free();
-  return $output;
+  global $db2;
+  $query = $db2->query('SELECT id, name, code, releasedate, standard, modern FROM sets WHERE regular = 1 ORDER BY releasedate DESC');
+
+  return $query->fetchAll();
 }
 
 // get all the data for offline mode
 function getQuestionsAndCards($db) {
-  $questionQuery = "SELECT qt.* FROM question_translations qt
-    LEFT JOIN questions q ON q.id = qt.question_id
-    WHERE q.live = 1";
-  $result = $db->query($questionQuery) or die($db->error());
-  $questions = array();
-  while($row = $result->fetch_assoc()) {
-    if(!isset($questions[$row['question_id']])) $questions[$row['question_id']] = array();
-    $questions[$row['question_id']][$row['language_id']] = array(
-      "question" => $row["question"],
-      "answer" => $row["answer"]
-    );
+  global $db2;
+
+  $start_time = microtime(TRUE);
+
+  // All questions
+  $questions = [];
+
+  $query = $db2->query('
+    SELECT qt.*
+    FROM questions q
+    LEFT JOIN question_translations qt ON qt.question_id = q.id
+    WHERE q.live = 1
+  ');
+  while($row = $query->fetch()) {
+    if(!array_key_exists($row['question_id'], $questions)) {
+      $questions[$row['question_id']] = ['cards' => []];
+    }
+
+    $questions[$row['question_id']][$row['language_id']] = [
+      'question' => $row['question'],
+      'answer' => $row['answer'],
+    ];
   }
-  $result->free();
-  $cardQuery = "SELECT c.*, GROUP_CONCAT(language_id,':',ct.name SEPARATOR '|') AS translations,
-    GROUP_CONCAT(DISTINCT qc.question_id) questions FROM cards c
-    LEFT JOIN card_translations ct ON ct.card_id = c.id
-    LEFT JOIN question_cards qc ON qc.card_id = c.id
-    WHERE question_id
-    GROUP BY c.id
-    ORDER BY qc.sort ASC, c.layout, c.name ASC";
-  $result = $db->query($cardQuery) or die($db->error);
-  $cards = array();
-  while($row = $result->fetch_assoc()) {
-    if ( $row['translations'] != null ) {
-      $translations = explode( "|", $row['translations'] );
-      $row['translations'] = array();
-      foreach ( $translations as $translation ) {
-        $translation = explode( ":", $translation, 2 );
-        $row['translations'][ $translation[0] ] = $translation[1];
-      }
+
+  // All cards
+  $cards = [];
+  // I don't use GROUP CONCAT to avoid overload on database
+  $query = $db2->query('
+    SELECT c.*, qc.question_id
+    FROM cards as c
+    JOIN question_cards as qc ON qc.card_id = c.id
+    JOIN questions as q ON q.id = qc.question_id
+    WHERE q.live = 1
+    ORDER BY qc.sort ASC, c.layout, c.name ASC
+  ');
+  $end_time = microtime(TRUE);
+
+  while($row = $query->fetch()) {
+    if(!array_key_exists($row['id'], $cards)) {
+      // Do we really need to remove empty fields?
+      $cards[$row['id']] = array_filter($row, function ($value, $field) {
+        return !($value === "" || $value === null || $field === 'id' || $field === 'question_id');
+      }, ARRAY_FILTER_USE_BOTH);
     }
-    $questionIds = explode(",",$row['questions']);
-    foreach($questionIds as $question) {
-      if(!isset($questions[$question]["cards"])) $questions[$question]["cards"] = array();
-      array_push($questions[$question]["cards"], $row['id']);
+
+    if(!in_array($row['id'], $questions[$row['question_id']]['cards'])) {
+      $questions[$row['question_id']]['cards'][] = $row['id'];
     }
-    foreach($row as $field=>$value) {
-      if($value === "" || $value === null || $field == "questions") unset($row[$field]);
-    }
-    $cards[$row['id']] = $row;
   }
-  return array("questions"=>$questions, "cards"=>$cards);
+
+  // fetch translations only for used cards
+  $query = $db2->query('
+    SELECT ct.*
+    FROM card_translations as ct
+    WHERE card_id IN (' . implode(', ', array_keys($cards)) . ')
+  ');
+
+  while($row = $query->fetch()) {
+    $cards[$row['card_id']]['translations'][$row['language_id']] = $row['name'];
+  }
+
+  $end_time = microtime(TRUE);
+
+  return [
+    'questions' => $questions,
+    'cards' => $cards,
+  ];
 }
 
-function getAdminQuestions($db, $page) {
+function getAdminQuestions($db, $page = 0) {
+  global $db2;
+
   $user = auth($db);
-  $pagesize = 10;
-  if(isset($user['role']) && in_array($user['role'],array("admin", "editor", "translator"))){
-    $start = intval($page) * $pagesize;
-    $query = "SELECT SQL_CALC_FOUND_ROWS q.*,
-      GROUP_CONCAT(DISTINCT c.name ORDER BY sort ASC SEPARATOR '|') cards,
-      GROUP_CONCAT(DISTINCT qt2.language_id) languages,
-      GROUP_CONCAT(DISTINCT qt3.language_id) outdated
-      FROM questions q
-      LEFT JOIN question_cards qc ON qc.question_id = q.id
-      LEFT JOIN cards c ON qc.card_id = c.id
-      LEFT JOIN question_translations qt ON qt.question_id = q.id AND qt.language_id = 1
-      LEFT JOIN question_translations qt2 ON qt2.question_id = q.id
-      LEFT JOIN question_translations qt3 ON qt3.question_id = q.id AND qt3.changedate < qt.changedate
-      GROUP BY q.id
-      ORDER BY q.id DESC
-      LIMIT $start, $pagesize;";
-    $result = $db->query($query) or die($db->error);
-    $questions = array();
-    while(count($questions) < $pagesize && $row = $result->fetch_assoc()) {
-      $row['id'] = intval($row['id']);
-      $row['difficulty'] = intval($row['difficulty']);
-      $row['live'] = !!$row['live'];
-      $row['cards'] = explode("|", $row['cards']);
-      $row['languages'] = array_map("intval",explode(",", $row['languages']));
-      if(!$row['author']) unset($row['author']);
-      if($row['outdated']) $row['outdated'] = array_map("intval",explode(",", $row['outdated']));
-      else unset($row['outdated']);
-      array_push($questions, $row);
-    }
-    $result->free();
-    $query = "SELECT FOUND_ROWS() rows;";
-    $result = $db->query($query) or die($db->error);
-    $total = $result->fetch_assoc();
-    $result->free();
-    $response = array("questions"=>$questions, "pages"=>ceil($total['rows']/$pagesize));
-    return $response;
-  } else {
+
+  if(!array_key_exists('role', $user) || !in_array($user['role'], ['admin', 'editor', 'translator'])) {
     header('HTTP/1.0 401 Unauthorized');
-    return array();
+    return [];
   }
+
+  $pageSize = QUESTIONS_PER_PAGE;
+  $start = intval($page) * $pageSize;
+  // TODO: avoid too many join
+  $query = $db2->query("SELECT SQL_CALC_FOUND_ROWS q.*,
+    GROUP_CONCAT(DISTINCT c.name ORDER BY sort ASC SEPARATOR '|') cards,
+    GROUP_CONCAT(DISTINCT qt2.language_id) languages,
+    GROUP_CONCAT(DISTINCT qt3.language_id) outdated
+    FROM questions q
+    LEFT JOIN question_cards qc ON qc.question_id = q.id
+    LEFT JOIN cards c ON qc.card_id = c.id
+    LEFT JOIN question_translations qt ON qt.question_id = q.id AND qt.language_id = 1
+    LEFT JOIN question_translations qt2 ON qt2.question_id = q.id
+    LEFT JOIN question_translations qt3 ON qt3.question_id = q.id AND qt3.changedate < qt.changedate
+    GROUP BY q.id
+    ORDER BY q.id DESC
+    LIMIT $start, $pageSize");
+
+  $questions = [];
+
+  while($row = $query->fetch()) {
+    $row['live'] = !!$row['live'];
+    $row['cards'] = explode('|', $row['cards']);
+    $row['languages'] = array_map('intval', explode(',', $row['languages']));
+    $row['outdated'] = $row['outdated'] ? array_map('intval', explode(',', $row['outdated'])) : [];
+
+    $questions[] = $row;
+  }
+
+  $queryCount = $db2->query('SELECT FOUND_ROWS() as rows');
+  $count = $queryCount->fetch()['rows'];
+
+  return [
+    'questions' => $questions,
+    'pages' => ceil($count / $pageSize)
+  ];
 }
 
 function getAdminQuestion($db, $id) {
+  global $db2;
+
   $user = auth($db);
-  if(isset($user['role']) && in_array($user['role'],array("admin", "editor", "translator"))){
-    // get question details
-    $query = "SELECT q.*,
-       GROUP_CONCAT(DISTINCT c.id,':',c.name ORDER BY sort ASC SEPARATOR '|') cards,
-       GROUP_CONCAT(DISTINCT qt.language_id SEPARATOR '|') languages
-       FROM questions q
-       LEFT JOIN question_cards qc ON qc.question_id = q.id
-       LEFT JOIN cards c ON c.id = qc.card_id
-       LEFT JOIN question_translations qt ON qt.question_id = q.id
-       WHERE q.id = '".$db->real_escape_string($id)."'
-       GROUP BY q.id";
-    $result = $db->query($query) or die($db->error);
-    $question = $result->fetch_assoc();
-    $question['id'] = intval($question['id']);
-    $question['live'] = !!$question['live'];
-    $cards = explode("|",$question['cards']);
-    $question['languages'] = explode("|",$question['languages']);
-    $question['cards'] = array();
-    foreach($cards as $card) {
-      $card = explode(":",$card,2);
-      $question['cards'][] = array("id"=>intval($card[0]),"name"=>$card[1]);
-    }
-    $result->free();
 
-    // get english question text
-    $query = "SELECT qt.question, qt.answer, qt.changedate
-           FROM question_translations qt
-           WHERE qt.question_id = '".$db->real_escape_string($id)."' AND qt.language_id = 1";
-    $result = $db->query($query) or die($db->error);
-    $question = array_merge($question, $result->fetch_assoc());
-    $result->free();
-
-    return $question;
-  } else {
+  if(!array_key_exists('role', $user) || !in_array($user['role'], ['admin', 'editor', 'translator'])) {
     header('HTTP/1.0 401 Unauthorized');
-    return array();
+    return [];
   }
+
+  $stmt = $db2->prepare('SELECT * from questions WHERE id = ?');
+  $stmt->execute([$id]);
+  $question = $stmt->fetch();
+  $question['live'] = !!$question['live'];
+
+  // fetch translations
+  $stmt = $db2->prepare('SELECT * FROM question_translations WHERE question_id = ?');
+  $stmt->execute([$id]);
+  while($row = $stmt->fetch()) {
+    $question['languages'][] = $row['language_id'];
+
+    if($row['language_id'] === 1) {
+      $question['question'] = $row['question'];
+      $question['answer'] = $row['answer'];
+    }
+  }
+
+  // fetch all cards
+  $stmt = $db2->prepare('
+    SELECT c.*
+    FROM question_cards as qc
+    LEFT JOIN cards as c ON c.id = qc.card_id
+    WHERE question_id = ?
+    ORDER BY sort, layout, name');
+  $stmt->execute([$id]);
+  while($row = $stmt->fetch()) {
+    $question['cards'][] = [
+      'id' => $row['id'],
+      'name' => $row['name'],
+    ];
+  }
+
+  return $question;
 }
 
 function getAdminSuggest($db, $name) {
-  $query = "SELECT id, name, full_name FROM `cards`
-     WHERE name LIKE '".$db->real_escape_string($name)."%'
-     ORDER BY name ASC LIMIT 10";
-  $result = $db->query($query) or die($db->error);
-  $cards = array();
-  while($row = $result->fetch_assoc()) {
-    $row['id'] = intval($row['id']);
-    array_push($cards, $row);
+  global $db2;
+
+  $user = auth($db);
+  if(!array_key_exists('role', $user) || !in_array($user['role'], ['admin', 'editor', 'translator'])) {
+    header('HTTP/1.0 401 Unauthorized');
+    return [];
   }
-  $result->free();
-  return $cards;
+
+  $stmt = $db2->prepare('SELECT id, name, full_name FROM cards WHERE name LIKE ? ORDER BY name LIMIT 10');
+  $stmt->execute([$name . '%']);
+
+  return $stmt->fetchAll();
 }
 
 function postAdminSave($db) {
@@ -465,41 +537,45 @@ function getAdminTranslation($db, $language, $id) {
 }
 
 function getAdminUsers($db) {
+  global $db2;
+
   $user = auth($db);
-  if(isset($user['role']) && $user['role']=="admin") {
-    $query = "SELECT * FROM users ORDER BY role ASC, name ASC";
-    $result = $db->query($query) or die($db->error);
-    $users = array();
-    while($row = $result->fetch_assoc()) {
-      if(empty($row['languages'])) unset($row['languages']);
-      else $row['languages'] = array_map("intval",explode(",", $row['languages']));
-      $users[] = $row;
-    }
-    $result->free();
-    return $users;
-  } else {
+  if(!array_key_exists('role', $user) || !in_array($user['role'], ['admin'])) {
     header('HTTP/1.0 401 Unauthorized');
-    return array();
+    return [];
   }
+
+  $users = [];
+  $query = $db2->query('SELECT * FROM users ORDER BY role, name');
+
+  while($row = $query->fetch()) {
+    $row['languages'] = $row['languages'] ? array_map('intval', explode(',', $row['languages'])) : [];
+    $users[] = $row;
+  }
+
+  return $users;
 }
 
 function postAdminUser($db) {
+  global $db2;
   $user = auth($db);
-  $userObj = json_decode(file_get_contents('php://input'));
-  if(isset($user['role']) && $user['role']=="admin" && isset($userObj->email) && isset($userObj->name) && isset($userObj->role)){
-    $query = "REPLACE INTO users SET
-      name = '".$db->real_escape_string($userObj->name)."',
-      email = '".$db->real_escape_string($userObj->email)."',
-      role = '".$db->real_escape_string($userObj->role)."'";
-    if(isset($userObj->languages) && count($userObj->languages)) {
-      $query .= ", languages = '".$db->real_escape_string(join(',',$userObj->languages))."'";
-    }
-    $db->query($query) or die($db->error);
-    return "success";
-  } else {
+
+  if(!array_key_exists('role', $user) || !in_array($user['role'], ['admin'])) {
     header('HTTP/1.0 401 Unauthorized');
-    return "unauthorized";
+    return 'unauthorized';
   }
+
+  $userData = json_decode(file_get_contents('php://input'));
+
+  $stmt = $db2->prepare('REPLACE INTO users SET name = :name, email = :email, role = :role, languages = :languages');
+  $stmt->execute([
+    'name' => $userData->name,
+    'email' => $userData->email,
+    'role' => $userData->role,
+    'languages' => implode(',', $userData->languages ?: []),
+  ]);
+
+  return 'success';
 }
 
 function deleteAdminUser($db, $email) {
@@ -538,8 +614,7 @@ if(isset($_GET['action'])) {
       $_SESSION['auth'] = "";
       break;
     case "admin-questions":
-      if(!isset($_GET['page'])) $_GET['page'] = 0;
-      echo json_encode(getAdminQuestions($db, $_GET['page']));
+      echo json_encode(getAdminQuestions($db, isset($_GET['page']) ? $_GET['page'] : 0));
       break;
     case "admin-question":
       if(!isset($_GET['id'])) $_GET['id'] = 0;
